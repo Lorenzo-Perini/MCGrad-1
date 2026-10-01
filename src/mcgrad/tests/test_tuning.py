@@ -2,13 +2,17 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+import logging
+import sys
 import warnings
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
+from ax.api.client import Client
 from ax.api.configs import RangeParameterConfig
 from sklearn.model_selection import train_test_split
 
@@ -86,6 +90,183 @@ def test_oss_tuning_client_rejects_persistence() -> None:
         match="Experiment persistence is not supported by the open-source tuning API",
     ):
         tuning_module._create_oss_tuning_client(persist_experiment=True)
+
+
+def test_tuning_analyses_are_skipped_without_storage() -> None:
+    client = Client(random_seed=3)
+
+    with (
+        patch.object(client, "compute_analyses") as compute_analyses,
+        patch.object(tuning_module, "save_analysis_card") as save_analysis_card,
+    ):
+        tuning_module._generate_tuning_analyses(client)
+
+    compute_analyses.assert_not_called()
+    save_analysis_card.assert_not_called()
+
+
+def test_tuning_analyses_log_missing_storage_encoder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = Mock(
+        db_settings_set=True,
+        db_settings=SimpleNamespace(encoder=None),
+    )
+
+    with (
+        caplog.at_level(logging.ERROR, logger=TUNING_MODULE),
+        patch.object(tuning_module, "save_analysis_card") as save_analysis_card,
+    ):
+        tuning_module._generate_tuning_analyses(client)
+
+    client.compute_analyses.assert_not_called()
+    save_analysis_card.assert_not_called()
+    assert (
+        "Ax storage is configured without an analysis-card encoder" in caplog.messages
+    )
+
+
+def test_tuning_analyses_load_analysis_dependencies_lazily(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overview_module = ModuleType("ax.analysis.overview")
+    save_module = ModuleType("ax.storage.sqa_store.save")
+    saved_cards = []
+
+    class FakeOverviewAnalysis:
+        pass
+
+    def fake_save_analysis_card(**kwargs: Any) -> None:
+        saved_cards.append(kwargs)
+
+    overview_module.__dict__["OverviewAnalysis"] = FakeOverviewAnalysis
+    save_module.__dict__["save_analysis_card"] = fake_save_analysis_card
+    monkeypatch.setitem(sys.modules, "ax.analysis.overview", overview_module)
+    monkeypatch.setitem(sys.modules, "ax.storage.sqa_store.save", save_module)
+
+    analysis_card = object()
+    storage_config = object()
+    experiment = object()
+    client = Mock(
+        db_settings_set=True,
+        db_settings=SimpleNamespace(
+            encoder=SimpleNamespace(config=storage_config),
+        ),
+        _experiment=experiment,
+    )
+    client.compute_analyses.return_value = [analysis_card]
+
+    tuning_module._generate_tuning_analyses(client)
+
+    client.compute_analyses.assert_called_once()
+    compute_kwargs = client.compute_analyses.call_args.kwargs
+    assert compute_kwargs["display"] is False
+    analyses = compute_kwargs["analyses"]
+    assert len(analyses) == 1
+    assert isinstance(analyses[0], FakeOverviewAnalysis)
+    assert saved_cards == [
+        {
+            "experiment": experiment,
+            "analysis_card": analysis_card,
+            "config": storage_config,
+        }
+    ]
+
+
+def test_tuning_analyses_log_failures(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overview_module = ModuleType("ax.analysis.overview")
+
+    class FakeOverviewAnalysis:
+        pass
+
+    overview_module.__dict__["OverviewAnalysis"] = FakeOverviewAnalysis
+    monkeypatch.setitem(sys.modules, "ax.analysis.overview", overview_module)
+
+    client = Mock(
+        db_settings_set=True,
+        db_settings=SimpleNamespace(
+            encoder=SimpleNamespace(config=object()),
+        ),
+    )
+    client.compute_analyses.side_effect = RuntimeError("analysis failed")
+
+    with caplog.at_level(logging.ERROR, logger=TUNING_MODULE):
+        tuning_module._generate_tuning_analyses(client)
+
+    error_records = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR and record.name == TUNING_MODULE
+    ]
+    assert len(error_records) == 1
+    assert error_records[0].exc_info is not None
+    assert str(error_records[0].exc_info[1]) == "analysis failed"
+
+
+def test_prepare_tuning_data_rejects_cross_validation_with_validation_data(
+    sample_data: pd.DataFrame,
+    sample_val_data: pd.DataFrame,
+    mock_mcgrad_model: Mock,
+) -> None:
+    mock_mcgrad_model.early_stopping_estimation_method = (
+        methods._EstimationMethod.CROSS_VALIDATION
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Early stopping with cross validation is not supported when passing "
+            "validation data into tuning or final fit."
+        ),
+    ):
+        tuning_module._prepare_tuning_data(
+            model=mock_mcgrad_model,
+            df_train=sample_data,
+            df_val=sample_val_data,
+            label_column_name="label",
+            pass_df_val_into_tuning=True,
+            pass_df_val_into_final_fit=False,
+        )
+
+
+@pytest.mark.arm64_incompatible
+@pytest.mark.parametrize("generate_ax_analyses", [True, False])
+def test_tune_mcgrad_params_generates_analyses_after_all_trials_only_when_requested(
+    sample_data: pd.DataFrame,
+    mock_mcgrad_model: Mock,
+    generate_ax_analyses: bool,
+) -> None:
+    client = Client(random_seed=0)
+    n_trials = 2
+    trial_counts_at_analysis: list[int] = []
+
+    with patch.object(
+        tuning_module,
+        "_generate_tuning_analyses",
+        side_effect=lambda ax_client: trial_counts_at_analysis.append(
+            len(ax_client._experiment.trials)
+        ),
+    ) as generate_analyses:
+        tuning_module._tune_mcgrad_params(
+            model=mock_mcgrad_model,
+            df_train=sample_data,
+            prediction_column_name="prediction",
+            label_column_name="label",
+            n_trials=n_trials,
+            ax_client=client,
+            experiment_name="test_generate_analyses",
+            experiment_owner=None,
+            generate_ax_analyses=generate_ax_analyses,
+        )
+
+    if generate_ax_analyses:
+        generate_analyses.assert_called_once_with(client)
+        assert trial_counts_at_analysis == [n_trials]
+    else:
+        generate_analyses.assert_not_called()
 
 
 @pytest.mark.arm64_incompatible

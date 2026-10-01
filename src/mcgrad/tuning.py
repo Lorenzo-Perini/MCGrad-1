@@ -163,31 +163,62 @@ def _create_oss_tuning_client(
     return Client(random_seed=random_seed)
 
 
-def _tune_mcgrad_params(
+def _create_overview_analysis() -> Any:
+    from ax.analysis.overview import OverviewAnalysis
+
+    return OverviewAnalysis()
+
+
+def save_analysis_card(
+    *,
+    experiment: Any,
+    analysis_card: Any,
+    config: Any,
+) -> None:
+    from ax.storage.sqa_store.save import save_analysis_card as ax_save_analysis_card
+
+    ax_save_analysis_card(
+        experiment=experiment,
+        analysis_card=analysis_card,
+        config=config,
+    )
+
+
+def _generate_tuning_analyses(ax_client: Client) -> None:
+    """Compute an overview and persist it when Ax storage is configured."""
+    try:
+        if not ax_client.db_settings_set:
+            return
+
+        db_settings = ax_client.db_settings
+        if db_settings is None or db_settings.encoder is None:
+            logger.error("Ax storage is configured without an analysis-card encoder")
+            return
+
+        cards = ax_client.compute_analyses(
+            analyses=[_create_overview_analysis()],
+            display=False,
+        )
+        sqa_config = db_settings.encoder.config
+        for card in cards:
+            save_analysis_card(
+                experiment=ax_client._experiment,
+                analysis_card=card,
+                config=sqa_config,
+            )
+    except Exception:
+        logger.exception("Failed to generate or persist Ax tuning analyses")
+
+
+def _prepare_tuning_data(
+    *,
     model: methods._BaseMCGrad,
     df_train: pd.DataFrame,
-    prediction_column_name: str,
+    df_val: pd.DataFrame | None,
     label_column_name: str,
-    df_val: pd.DataFrame | None = None,
-    weight_column_name: str | None = None,
-    categorical_feature_column_names: list[str] | None = None,
-    numerical_feature_column_names: list[str] | None = None,
-    n_trials: int = 20,
-    n_warmup_random_trials: int | None = None,
-    parameter_configurations: list[RangeParameterConfig] | None = None,
-    pass_df_val_into_tuning: bool = False,
-    pass_df_val_into_final_fit: bool = False,
-    use_model_predictions: bool = False,
-    reference_parameters: dict[str, float | int] | None = None,
-    random_seed: int | None = None,
-    # @oss-disable[end= ]: _telemetry_overrides: dict[str, Any] | None = None,
-    *,
-    ax_client: Client,
-    experiment_name: str,
-    experiment_owner: str | None,
-) -> tuple[methods._BaseMCGrad | None, pd.DataFrame]:
-    """Run MCGrad tuning with the provided Ax client and experiment metadata."""
-
+    pass_df_val_into_tuning: bool,
+    pass_df_val_into_final_fit: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     if (
         not hasattr(model, "early_stopping_score_func")
         or model.early_stopping_score_func is None
@@ -219,8 +250,47 @@ def _tune_mcgrad_params(
         and (pass_df_val_into_tuning or pass_df_val_into_final_fit)
     ):
         raise ValueError(
-            "Early stopping with cross validation is not supported when passing validation data into tuning or final fit."
+            "Early stopping with cross validation is not supported when passing "
+            "validation data into tuning or final fit."
         )
+
+    return df_train, df_val
+
+
+def _tune_mcgrad_params(
+    model: methods._BaseMCGrad,
+    df_train: pd.DataFrame,
+    prediction_column_name: str,
+    label_column_name: str,
+    df_val: pd.DataFrame | None = None,
+    weight_column_name: str | None = None,
+    categorical_feature_column_names: list[str] | None = None,
+    numerical_feature_column_names: list[str] | None = None,
+    n_trials: int = 20,
+    n_warmup_random_trials: int | None = None,
+    parameter_configurations: list[RangeParameterConfig] | None = None,
+    pass_df_val_into_tuning: bool = False,
+    pass_df_val_into_final_fit: bool = False,
+    use_model_predictions: bool = False,
+    reference_parameters: dict[str, float | int] | None = None,
+    random_seed: int | None = None,
+    # @oss-disable[end= ]: _telemetry_overrides: dict[str, Any] | None = None,
+    *,
+    ax_client: Client,
+    experiment_name: str,
+    experiment_owner: str | None,
+    generate_ax_analyses: bool = False,
+) -> tuple[methods._BaseMCGrad | None, pd.DataFrame]:
+    """Run MCGrad tuning with the provided Ax client and experiment metadata."""
+
+    df_train, df_val = _prepare_tuning_data(
+        model=model,
+        df_train=df_train,
+        df_val=df_val,
+        label_column_name=label_column_name,
+        pass_df_val_into_tuning=pass_df_val_into_tuning,
+        pass_df_val_into_final_fit=pass_df_val_into_final_fit,
+    )
 
     df_param_val: pd.DataFrame | None = None
     if pass_df_val_into_tuning:
@@ -333,6 +403,9 @@ def _tune_mcgrad_params(
                     raw_data={metric_name: score},
                 )
                 logger.info(f"Trial {trial_index} completed with score: {score}")
+
+    if generate_ax_analyses:
+        _generate_tuning_analyses(ax_client)
 
     # Get trial results using summarize(), ordered so that the best trial comes first
     # for either optimization direction.
