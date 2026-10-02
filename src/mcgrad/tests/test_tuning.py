@@ -1875,7 +1875,9 @@ def test_tuning_minimization_direction(
 
 
 @pytest.mark.arm64_incompatible
-def test_tuning_enables_parameter_change_simplification(sample_data):
+def test_tuning_enables_parameter_change_simplification(
+    sample_data: pd.DataFrame,
+) -> None:
     """Tuned configurations should differ from the defaults only where it matters."""
     model = methods.MCGrad(
         num_rounds=0,
@@ -1883,18 +1885,20 @@ def test_tuning_enables_parameter_change_simplification(sample_data):
         lightgbm_params={"num_leaves": 2, "n_estimators": 1, "max_depth": 2},
     )
 
-    recorded_kwargs = {}
+    recorded_kwargs: dict[str, Any] = {}
     original_factory = tuning_module._create_oss_tuning_client
 
-    def recording_factory(**kwargs):
+    def recording_factory(**kwargs: Any) -> tuning_module.Client:
         client = original_factory(**kwargs)
         original_configure = client.configure_generation_strategy
 
-        def recording_configure(**gs_kwargs):
+        def recording_configure(**gs_kwargs: Any) -> None:
             recorded_kwargs.update(gs_kwargs)
             return original_configure(**gs_kwargs)
 
-        client.configure_generation_strategy = recording_configure
+        client.configure_generation_strategy = (
+            recording_configure  # pyrefly: ignore [bad-assignment]
+        )
         return client
 
     with patch.object(tuning_module, "_create_oss_tuning_client", recording_factory):
